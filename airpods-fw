@@ -32,24 +32,25 @@ PREDICATE = " OR ".join('process == "' + name + '"' for name in (
 # Bluetooth product IDs, not user-editable device names. Catalog associations are
 # limited to families whose Apple macOS catalog metadata has been verified.
 MODELS = {
-    0x2002: ("AirPods 1", None),
-    0x200F: ("AirPods 2", None),
-    0x2013: ("AirPods 3", None),
-    0x2019: ("AirPods 4", None),
-    0x201B: ("AirPods 4 with Active Noise Cancellation", None),
+    0x2002: ("AirPods 1", "A1523"),
+    0x200F: ("AirPods 2", "A2032"),
+    0x2013: ("AirPods 3", "A2564"),
+    0x2019: ("AirPods 4", "A3053"),
+    0x201B: ("AirPods 4 with Active Noise Cancellation", "A3056"),
     # CoreBluetoothUI B868e/B868m aliases; catalog Restore.plist verifies the boards.
     0x2036: ("AirPods 5", "A3532"),
     0x2037: ("AirPods 5", "A3532"),
     0x2030: ("AirPods 5 with Wireless Charging Case", "A3440"),
     0x2032: ("AirPods 5 with Wireless Charging Case", "A3440"),
-    0x200E: ("AirPods Pro 1", None),
-    0x2014: ("AirPods Pro 2 with MagSafe Charging Case (Lightning)", None),
+    0x200E: ("AirPods Pro 1", "A2084"),
+    0x2014: ("AirPods Pro 2 with MagSafe Charging Case (Lightning)", "A2618"),
     0x2024: ("AirPods Pro 2 with MagSafe Charging Case (USB-C)", "A3048"),
     0x2027: ("AirPods Pro 3", "A3064"),
-    0x200A: ("AirPods Max 1 (Lightning)", None),
-    0x201F: ("AirPods Max 1 (USB-C)", None),
+    0x200A: ("AirPods Max 1 (Lightning)", "A2096"),
+    0x201F: ("AirPods Max 1 (USB-C)", "A3184"),
     0x202D: ("AirPods Max 2", "A3454"),  # CoreBluetoothUI AssetPaths-B515d.plist
 }
+LEGACY_CATALOG_MODELS = {"A1523", "A2032", "A2564", "A2084", "A2096", "A3184"}
 STATUS_TEXT = {
     "current": "matches",
     "update_available": "newer version listed",
@@ -230,27 +231,49 @@ def parse_support(html):
     return versions
 
 
-def catalog_url(model):
+def catalog_type(model):
     if not re.fullmatch(r"A\d{4}", model):
         raise Error("Catalog model must look like A3064.")
-    stem = "com_apple_MobileAsset_UARP_" + model
-    return "https://mesu.apple.com/assets/macos/%s/%s.xml" % (stem, stem)
+    if model in LEGACY_CATALOG_MODELS:
+        return "com.apple.MobileAsset.MobileAccessoryUpdate.%s.EA" % model
+    return "com.apple.MobileAsset.UARP." + model
+
+
+def catalog_url(model):
+    stem = catalog_type(model).replace(".", "_")
+    # The first-generation catalog is still served under assets/, not assets/macos/.
+    root = "assets" if model == "A1523" else "assets/macos"
+    return "https://mesu.apple.com/%s/%s/%s.xml" % (root, stem, stem)
+
+
+def asset_build(asset, model):
+    build = asset.get("Build")
+    if build is None and model == "A1523":
+        parts = [asset.get("FirmwareVersion" + part) for part in ("Major", "Minor", "Release")]
+        if not all(type(part) is int and part >= 0 for part in parts):
+            raise Error("Invalid first-generation AirPods firmware version.")
+        build = ".".join(map(str, parts))
+    return clean(build) if build is not None else None
 
 
 def parse_catalog(data, model):
-    expected = "com.apple.MobileAsset.UARP." + model
-    if not isinstance(data, dict) or data.get("AssetType") != expected or not isinstance(data.get("Assets"), list):
+    expected_types = {catalog_type(model)}
+    device_name = model
+    if model in LEGACY_CATALOG_MODELS:
+        expected_types.add("MobileAccessoryUpdate_%s_EA" % model)
+        device_name = "AirPods" if model == "A1523" else "Bluetooth Headset"
+    if not isinstance(data, dict) or not isinstance(data.get("AssetType"), str) or data["AssetType"] not in expected_types or not isinstance(data.get("Assets"), list):
         raise Error("Unexpected MobileAsset catalog for " + model)
     assets = []
     for asset in data["Assets"]:
-        if not isinstance(asset, dict) or asset.get("DeviceName") != model:
+        if not isinstance(asset, dict) or asset.get("DeviceName") != device_name:
             raise Error("Unexpected device in MobileAsset catalog for " + model)
         size = asset.get("_DownloadSize")
         base, relative = asset.get("__BaseURL", ""), asset.get("__RelativePath", "")
         if (size is not None and (type(size) is not int or size < 0)) or not isinstance(base, str) or not isinstance(relative, str):
             raise Error("Invalid download metadata in MobileAsset catalog for " + model)
         assets.append({
-            "build": clean(asset.get("Build", "")) or None,
+            "build": asset_build(asset, model) or None,
             "download_bytes": size,
             "url": clean(urljoin(base, relative)) or None,
         })
@@ -263,16 +286,19 @@ def remote_catalog(model):
         assets = parse_catalog(plistlib.loads(fetch(url)), model)
     except (ValueError, plistlib.InvalidFileException, ExpatError) as exc:
         raise Error("Invalid MobileAsset plist at " + url) from exc
-    return {"model": model, "source": url, "assets": assets, "eligibility": "unknown"}
+    return {"model": model, "asset_type": catalog_type(model), "source": url,
+            "assets": assets, "eligibility": "unknown"}
 
 
 def local_assets(model=None):
     result, warnings = [], []
-    if model:
-        catalog_url(model)  # Validate before using the input as a path component.
-    folders = sorted(ASSET_ROOT.glob("com_apple_MobileAsset_UARP_" + (model or "A[0-9][0-9][0-9][0-9]")))
+    patterns = [catalog_type(model).replace(".", "_")] if model else [
+        "com_apple_MobileAsset_UARP_A[0-9][0-9][0-9][0-9]",
+        *(catalog_type(m).replace(".", "_") for m in sorted(LEGACY_CATALOG_MODELS)),
+    ]
+    folders = sorted(folder for pattern in patterns for folder in ASSET_ROOT.glob(pattern))
     for folder in folders:
-        family = folder.name.rsplit("_", 1)[1]
+        family = re.search(r"_(A\d{4})(?:_EA)?$", folder.name)[1]
         for path in [folder / (folder.name + ".xml")] + sorted(folder.glob("*.asset/Info.plist")):
             if not path.exists():
                 continue
@@ -283,14 +309,17 @@ def local_assets(model=None):
                     kind = "cached_catalog"
                 else:
                     props = data.get("MobileAssetProperties", {})
-                    assets = [{"build": clean(props.get("Build", "")) or None,
+                    bundle = path.parent / "AssetData" / props.get("FirmwareBundle", "Firmware.acsw")
+                    info = bundle / "Info.plist"
+                    image_name = plistlib.loads(info.read_bytes()).get("FirmwareImageFile", "firmware.uarp") if info.is_file() else "firmware.uarp"
+                    assets = [{"build": asset_build(props, family) or None,
                                "bundle_version": data.get("CFBundleShortVersionString"),
-                               "payload_present": (path.parent / "AssetData/Firmware.acsw/firmware.uarp").is_file()}]
+                               "payload_present": (bundle / image_name).is_file()}]
                     kind = "local_asset"
                 result.append({"model": family, "kind": kind, "source": str(path),
                                "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
                                "assets": assets, "eligibility": "unknown"})
-            except (OSError, ValueError, plistlib.InvalidFileException, ExpatError, Error, AttributeError) as exc:
+            except (OSError, ValueError, TypeError, plistlib.InvalidFileException, ExpatError, Error, AttributeError) as exc:
                 warnings.append("Could not read %s: %s" % (path, exc))
     return result, warnings
 

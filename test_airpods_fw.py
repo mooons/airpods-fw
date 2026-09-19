@@ -134,6 +134,34 @@ class AirPodsFirmwareTests(unittest.TestCase):
         self.assertEqual(device["catalog"]["assets"][0]["build"], "9A348")
         self.assertEqual(device["catalog"]["eligibility"], "unknown")
 
+    def test_legacy_catalog_formats_and_first_generation_version(self):
+        legacy = catalog("6F21", "A2032")
+        legacy["Assets"][0]["DeviceName"] = "Bluetooth Headset"
+        for asset_type in ("MobileAccessoryUpdate_A2032_EA",
+                           "com.apple.MobileAsset.MobileAccessoryUpdate.A2032.EA"):
+            legacy["AssetType"] = asset_type
+            self.assertEqual(fw.parse_catalog(legacy, "A2032")[0]["build"], "6F21")
+        self.assertIn("/assets/macos/com_apple_MobileAsset_MobileAccessoryUpdate_A2032_EA/",
+                      fw.catalog_url("A2032"))
+        with self.assertRaises(fw.Error):
+            fw.parse_catalog(legacy, "A2084")  # Same generic DeviceName, different model.
+        with self.assertRaises(fw.Error):
+            fw.parse_catalog(legacy, "A3064")
+        del legacy["Assets"][0]["Build"]
+        self.assertIsNone(fw.parse_catalog(legacy, "A2032")[0]["build"])
+        legacy["AssetType"] = "com.apple.MobileAsset.MobileAccessoryUpdate.A1523.EA"
+        legacy["Assets"][0].update(DeviceName="AirPods", FirmwareVersionMajor=6,
+                                    FirmwareVersionMinor=8, FirmwareVersionRelease=8)
+        self.assertEqual(fw.parse_catalog(legacy, "A1523")[0]["build"], "6.8.8")
+        self.assertIn("/assets/com_apple_MobileAsset_MobileAccessoryUpdate_A1523_EA/",
+                      fw.catalog_url("A1523"))
+        legacy["Assets"][0]["FirmwareVersionMinor"] = "8"
+        with self.assertRaises(fw.Error):
+            fw.parse_catalog(legacy, "A1523")
+        legacy["AssetType"] = []
+        with self.assertRaises(fw.Error):
+            fw.parse_catalog(legacy, "A1523")
+
     def test_network_failure_preserves_installed_firmware_in_json(self):
         with patch.object(fw, "read_devices", return_value=fw.parse_devices(profiler())), patch.object(fw, "fetch", side_effect=fw.Error("offline")):
             code, output, errors = self.invoke("check", "--json")
@@ -195,6 +223,26 @@ class AirPodsFirmwareTests(unittest.TestCase):
                 payload.parent.mkdir(parents=True)
                 payload.touch()
                 self.assertTrue(fw.local_assets("A3064")[0][1]["assets"][0]["payload_present"])
+
+                folder = root / "com_apple_MobileAsset_MobileAccessoryUpdate_A2032_EA"
+                folder.mkdir()
+                legacy = catalog("6F21", "A2032")
+                legacy["AssetType"] = "MobileAccessoryUpdate_A2032_EA"
+                legacy["Assets"][0]["DeviceName"] = "Bluetooth Headset"
+                (folder / (folder.name + ".xml")).write_bytes(plistlib.dumps(legacy))
+                asset = folder / "legacy.asset"
+                bundle = asset / "AssetData/Firmware.acsw"
+                bundle.mkdir(parents=True)
+                (asset / "Info.plist").write_bytes(plistlib.dumps({
+                    "MobileAssetProperties": {"Build": "6F21", "FirmwareBundle": "Firmware.acsw"}}))
+                (bundle / "Info.plist").write_bytes(plistlib.dumps({"FirmwareImageFile": "ftab.bin"}))
+                self.assertFalse(fw.local_assets("A2032")[0][1]["assets"][0]["payload_present"])
+                (bundle / "ftab.bin").touch()
+                result, warnings = fw.local_assets()
+                self.assertFalse(warnings)
+                self.assertEqual({r["model"] for r in result}, {"A2032", "A3064"})
+                legacy_asset = next(r for r in result if r["model"] == "A2032" and r["kind"] == "local_asset")
+                self.assertTrue(legacy_asset["assets"][0]["payload_present"])
 
     def test_logs_invokes_native_log_with_bounded_duration(self):
         with patch.object(fw, "require_macos"), patch.object(fw.subprocess, "call", return_value=0) as call:

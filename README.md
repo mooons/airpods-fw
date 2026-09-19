@@ -42,7 +42,7 @@ directly. `uv --version` checks the uv prerequisite. You can also bypass uv with
 | Command | Behavior |
 | --- | --- |
 | `status` | Read `system_profiler SPBluetoothDataType -json`. Show connection state, model, installed/case firmware and any reported batteries. Disconnected entries are cached observations. |
-| `check` | Fetch Apple's current support-page versions and known macOS MobileAsset catalogs. Report them separately with their sources. |
+| `check` | Fetch Apple's current support-page versions and verified MobileAsset catalogs. Report them separately with their sources. |
 | `update` | Verify the local launchd notification registration, then post `com.apple.SoftwareUpdate.ScanTriggered` once with `notifyutil`. |
 | `logs` | Stream raw unified logs from `uarpassetmanagerd`, `uarpd`, `accessoryupdaterd` and `UARPUpdaterServiceLegacyAudio`. |
 | `assets` | Read remote catalog metadata, or inspect cached catalogs and downloaded payload metadata using `--local`. No firmware files are downloaded or modified. |
@@ -116,13 +116,13 @@ eligibility or enroll/unenroll a device in beta firmware.
   These are dated observations, not hardcoded latest versions. Catalog presence
   alone does not prove public/beta channel or eligibility. Support-page and
   cached information may lag. Local assets never determine “latest public.”
-- Known automatic catalog associations are AirPods 5 → `A3532`,
-  AirPods 5 with Wireless Charging Case → `A3440`, AirPods Pro 3 → `A3064`,
-  AirPods Pro 2 USB-C → `A3048`, and AirPods Max 2 → `A3454`.
-  Use `assets --model Axxxx` to query another
-  family; not every model has a catalog at this URL pattern. HTTP errors are
-  reported rather than interpreted as “no update.” Local inspection also finds
-  case families such as `A2968` and `A3122` without treating them as earbud models.
+- All known models have verified catalog associations; see the table below.
+  Newer models use `com.apple.MobileAsset.UARP.<model>`. Older models use
+  `com.apple.MobileAsset.MobileAccessoryUpdate.<model>.EA`; placing their IDs
+  under the UARP URL returns HTTP errors. Both feed formats are supported by
+  `check`, `assets`, and `assets --local`. HTTP errors are reported rather than
+  interpreted as “no update.” Local inspection also finds case families such as
+  `A2968` and `A3122` without treating them as earbud models.
 - Product-ID mappings were checked against
   [AirBattery](https://github.com/lihaoyun6/AirBattery/blob/main/AirBattery/Supports/Supports.swift)
   and local Bluetooth observations (including Pro 3 `0x2027`). Model labels and
@@ -148,9 +148,43 @@ eligibility or enroll/unenroll a device in beta firmware.
   `255.15.15`, missing values and beta suffixes have unknown ordering. The
   catalog's `Build` is used instead of assuming its numeric fields encode a
   conventional version; the live Pro 3 catalog had nonstandard numeric fields.
+  First-generation AirPods are the verified exception: their catalog omits
+  `Build` and supplies `6`, `8`, `8` as the major/minor/release fields (`6.8.8`).
 - Logs cover all matching accessory processes, may contain device identifiers,
   and may be empty or privacy-redacted. They are intentionally not converted
   into guessed percentages or claims of successful installation.
+
+### Verified catalogs
+
+Fetched and validated against Apple on September 19, 2026. Feed names identify
+the catalog, which can differ from the printed model number (notably `A2618`
+for AirPods Pro 2 with Lightning). No latest versions are hardcoded.
+
+| Model | Catalog ID | Feed |
+| --- | --- | --- |
+| AirPods 1 | `A1523` | MobileAccessoryUpdate EA |
+| AirPods 2 | `A2032` | MobileAccessoryUpdate EA |
+| AirPods 3 | `A2564` | MobileAccessoryUpdate EA |
+| AirPods 4 | `A3053` | UARP |
+| AirPods 4 with ANC | `A3056` | UARP |
+| AirPods 5 | `A3532` | UARP |
+| AirPods 5 with Wireless Charging Case | `A3440` | UARP |
+| AirPods Pro 1 | `A2084` | MobileAccessoryUpdate EA |
+| AirPods Pro 2 (Lightning) | `A2618` | UARP |
+| AirPods Pro 2 (USB-C) | `A3048` | UARP |
+| AirPods Pro 3 | `A3064` | UARP |
+| AirPods Max 1 (Lightning) | `A2096` | MobileAccessoryUpdate EA |
+| AirPods Max 1 (USB-C) | `A3184` | MobileAccessoryUpdate EA |
+| AirPods Max 2 | `A3454` | UARP |
+
+All use Apple's `/assets/macos/` catalog path except first-generation AirPods,
+whose working feed is under `/assets/`. Example legacy catalog:
+[AirPods 2](https://mesu.apple.com/assets/macos/com_apple_MobileAsset_MobileAccessoryUpdate_A2032_EA/com_apple_MobileAsset_MobileAccessoryUpdate_A2032_EA.xml).
+[The Apple Wiki's asset index](https://theapplewiki.com/wiki/List_of_Asset_Types)
+provided the legacy feed names, subsequently verified against Apple's live
+catalogs. The `A2618` payload's `Restore.plist` also confirms `AirPods3,1` / board
+`b698ap`. Catalog access and local metadata inspection do not establish that a
+firmware installation works on every listed model.
 
 ## Verification
 
