@@ -1,0 +1,551 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
+"""Inspect AirPods firmware and request Apple's macOS accessory-update scan."""
+
+import argparse
+import hashlib
+import json
+import plistlib
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.error import URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+from xml.parsers.expat import ExpatError
+
+SUPPORT_URL = "https://support.apple.com/en-us/106340"
+NOTIFICATION = "com.apple.SoftwareUpdate.ScanTriggered"
+LAUNCH_PLIST = Path("/System/Library/LaunchDaemons/com.apple.uarpassetmanagerd.plist")
+ASSET_ROOT = Path("/System/Library/AssetsV2")
+PREDICATE = " OR ".join('process == "' + name + '"' for name in (
+    "uarpassetmanagerd", "uarpd", "accessoryupdaterd", "UARPUpdaterServiceLegacyAudio"))
+
+# Bluetooth product IDs, not user-editable device names. Catalog associations are
+# limited to families whose Apple macOS catalog metadata has been verified.
+MODELS = {
+    0x2002: ("AirPods 1", None),
+    0x200F: ("AirPods 2", None),
+    0x2013: ("AirPods 3", None),
+    0x2019: ("AirPods 4", None),
+    0x201B: ("AirPods 4 with Active Noise Cancellation", None),
+    # CoreBluetoothUI B868e/B868m aliases; catalog Restore.plist verifies the boards.
+    0x2036: ("AirPods 5", "A3532"),
+    0x2037: ("AirPods 5", "A3532"),
+    0x2030: ("AirPods 5 with Wireless Charging Case", "A3440"),
+    0x2032: ("AirPods 5 with Wireless Charging Case", "A3440"),
+    0x200E: ("AirPods Pro 1", None),
+    0x2014: ("AirPods Pro 2 with MagSafe Charging Case (Lightning)", None),
+    0x2024: ("AirPods Pro 2 with MagSafe Charging Case (USB-C)", "A3048"),
+    0x2027: ("AirPods Pro 3", "A3064"),
+    0x200A: ("AirPods Max 1 (Lightning)", None),
+    0x201F: ("AirPods Max 1 (USB-C)", None),
+    0x202D: ("AirPods Max 2", "A3454"),  # CoreBluetoothUI AssetPaths-B515d.plist
+}
+STATUS_TEXT = {
+    "current": "matches",
+    "update_available": "newer version listed",
+    "ahead": "installed version is newer than this listing",
+    "unknown": "comparison unavailable",
+}
+
+
+class Error(Exception):
+    pass
+
+
+def clean(value):
+    """Remove firmware's observed zero-width characters and terminal controls."""
+    return "".join(c for c in str(value) if not unicodedata.category(c).startswith("C")).strip()
+
+
+def version_key(version):
+    value = clean(version or "")
+    build = re.fullmatch(r"(\d+)([A-Z])(\d+)", value)
+    if build:
+        return int(build[1]), ord(build[2]) - ord("A"), int(build[3])
+    if re.fullmatch(r"\d+\.\d+\.\d+", value):
+        parts = tuple(map(int, value.split(".")))
+        if parts != (0, 0, 0) and parts[0] != 255:
+            return parts
+    # Unknown encodings and beta suffixes must not cause downgrade advice.
+    return None
+
+
+def compare(installed, latest):
+    left, right = version_key(installed), version_key(latest)
+    if left is None or right is None:
+        return "unknown"
+    return "current" if left == right else "update_available" if left < right else "ahead"
+
+
+def product_id(value):
+    if isinstance(value, int):
+        return value
+    match = re.match(r"(?:0x)?([0-9a-fA-F]{4})(?:\b|$)", str(value))
+    return int(match[1], 16) if match else None
+
+
+def parse_devices(data):
+    if not isinstance(data, dict) or not isinstance(data.get("SPBluetoothDataType"), list):
+        raise Error("Unexpected system_profiler Bluetooth JSON format.")
+    devices = {}
+    for adapter in data["SPBluetoothDataType"]:
+        for state in ("device_connected", "device_not_connected"):
+            for entry in adapter.get(state, []):
+                for name, info in entry.items():
+                    if not isinstance(info, dict):
+                        continue
+                    pid = product_id(info.get("device_productID"))
+                    vendor = product_id(info.get("device_vendorID"))
+                    known = MODELS.get(pid) if vendor in (None, 0x004C) else None
+                    if not known and "airpods" not in name.casefold():
+                        continue
+                    identity = info.get("device_address") or info.get("device_serialNumber")
+                    identity = identity or str(pid) + ":" + name
+                    device_id = hashlib.sha256(identity.encode()).hexdigest()[:12]
+                    if device_id in devices and (devices[device_id]["connected"] or state != "device_connected"):
+                        continue
+                    devices[device_id] = {
+                        "id": device_id,
+                        "name": clean(name),
+                        "model": known[0] if known else None,
+                        "product_id": "0x%04X" % pid if pid is not None else None,
+                        "catalog_model": known[1] if known else None,
+                        "connected": state == "device_connected",
+                        "installed": clean(info.get("device_firmwareVersion", "")) or None,
+                        "case_version": clean(info.get("device_caseVersion", "")) or None,
+                        "battery": {
+                            part: clean(info[key])
+                            for part, key in (("left", "device_batteryLevelLeft"),
+                                              ("right", "device_batteryLevelRight"),
+                                              ("case", "device_batteryLevelCase"),
+                                              ("main", "device_batteryLevelMain"))
+                            if key in info
+                        },
+                    }
+    return list(devices.values())
+
+
+def require_macos():
+    if sys.platform != "darwin":
+        raise Error("This command requires macOS.")
+
+
+def run(command, timeout=60):
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Error("Could not run %s: %s" % (command[0], exc)) from exc
+    if result.returncode:
+        raise Error("%s failed (%s): %s" % (
+            command[0], result.returncode, clean(result.stderr) or "no diagnostic output"))
+    return result.stdout
+
+
+def read_devices():
+    require_macos()
+    try:
+        return parse_devices(json.loads(run([
+            "/usr/sbin/system_profiler", "SPBluetoothDataType", "-json"])))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise Error("Could not parse system_profiler Bluetooth data: %s" % exc) from exc
+
+
+def select_devices(devices, selector):
+    if not selector:
+        return devices
+    query = selector.casefold()
+    exact = [d for d in devices if query in (d["id"], d["name"].casefold())]
+    matches = exact or [d for d in devices if any(query in (d[k] or "").casefold()
+                       for k in ("name", "model", "product_id", "catalog_model"))]
+    if not matches:
+        raise Error("No AirPods match %r. Run airpods-fw status to list devices." % selector)
+    return matches
+
+
+def fetch(url):
+    try:
+        with urlopen(Request(url, headers={"User-Agent": "airpods-fw/1.0"}), timeout=20) as response:
+            data = response.read(4 * 1024 * 1024 + 1)
+        if len(data) > 4 * 1024 * 1024:
+            raise Error("Response is too large: " + url)
+        return data
+    except (OSError, URLError, ValueError) as exc:
+        raise Error("Could not fetch %s: %s" % (url, exc)) from exc
+
+
+class SupportParser(HTMLParser):
+    """Read only the current-version section, never historical release notes."""
+    def __init__(self):
+        super().__init__()
+        self.active = False
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "h2":
+            self.active = dict(attrs).get("id") == "latest"
+        if self.active and tag in ("p", "li", "br"):
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self.active:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag):
+        if self.active and tag in ("p", "li"):
+            self.parts.append("\n")
+
+
+def model_key(name):
+    name = clean(name).casefold()
+    name = re.sub(r"\((\d+)(?:st|nd|rd|th) generation\)", r"\1", name)
+    name = re.sub(r"airpods max(?=\s*\()", "airpods max 1", name)
+    if name == "airpods pro":
+        name = "airpods pro 1"
+    return re.sub(r"[^a-z0-9]", "", name)
+
+
+def parse_support(html):
+    parser = SupportParser()
+    parser.feed(html)
+    versions = {}
+    for line in "".join(parser.parts).splitlines():
+        match = re.fullmatch(r"\s*(AirPods[^:]*):\s*(\d+[A-Z]\d+[a-z]?|\d+\.\d+\.\d+)\s*", clean(line))
+        if match:
+            key, version = model_key(match[1]), match[2]
+            if key in versions and versions[key] != version:
+                raise Error("Apple's support page contains conflicting versions for " + match[1])
+            versions[key] = version
+    if not versions:
+        raise Error("Apple's latest-firmware section was not recognized; page format may have changed.")
+    return versions
+
+
+def catalog_url(model):
+    if not re.fullmatch(r"A\d{4}", model):
+        raise Error("Catalog model must look like A3064.")
+    stem = "com_apple_MobileAsset_UARP_" + model
+    return "https://mesu.apple.com/assets/macos/%s/%s.xml" % (stem, stem)
+
+
+def parse_catalog(data, model):
+    expected = "com.apple.MobileAsset.UARP." + model
+    if not isinstance(data, dict) or data.get("AssetType") != expected or not isinstance(data.get("Assets"), list):
+        raise Error("Unexpected MobileAsset catalog for " + model)
+    assets = []
+    for asset in data["Assets"]:
+        if not isinstance(asset, dict) or asset.get("DeviceName") != model:
+            raise Error("Unexpected device in MobileAsset catalog for " + model)
+        size = asset.get("_DownloadSize")
+        base, relative = asset.get("__BaseURL", ""), asset.get("__RelativePath", "")
+        if (size is not None and (type(size) is not int or size < 0)) or not isinstance(base, str) or not isinstance(relative, str):
+            raise Error("Invalid download metadata in MobileAsset catalog for " + model)
+        assets.append({
+            "build": clean(asset.get("Build", "")) or None,
+            "download_bytes": size,
+            "url": clean(urljoin(base, relative)) or None,
+        })
+    return assets
+
+
+def remote_catalog(model):
+    url = catalog_url(model)
+    try:
+        assets = parse_catalog(plistlib.loads(fetch(url)), model)
+    except (ValueError, plistlib.InvalidFileException, ExpatError) as exc:
+        raise Error("Invalid MobileAsset plist at " + url) from exc
+    return {"model": model, "source": url, "assets": assets, "eligibility": "unknown"}
+
+
+def local_assets(model=None):
+    result, warnings = [], []
+    if model:
+        catalog_url(model)  # Validate before using the input as a path component.
+    folders = sorted(ASSET_ROOT.glob("com_apple_MobileAsset_UARP_" + (model or "A[0-9][0-9][0-9][0-9]")))
+    for folder in folders:
+        family = folder.name.rsplit("_", 1)[1]
+        for path in [folder / (folder.name + ".xml")] + sorted(folder.glob("*.asset/Info.plist")):
+            if not path.exists():
+                continue
+            try:
+                data = plistlib.loads(path.read_bytes())
+                if path.suffix == ".xml":
+                    assets = parse_catalog(data, family)
+                    kind = "cached_catalog"
+                else:
+                    props = data.get("MobileAssetProperties", {})
+                    assets = [{"build": clean(props.get("Build", "")) or None,
+                               "bundle_version": data.get("CFBundleShortVersionString"),
+                               "payload_present": (path.parent / "AssetData/Firmware.acsw/firmware.uarp").is_file()}]
+                    kind = "local_asset"
+                result.append({"model": family, "kind": kind, "source": str(path),
+                               "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+                               "assets": assets, "eligibility": "unknown"})
+            except (OSError, ValueError, plistlib.InvalidFileException, ExpatError, Error, AttributeError) as exc:
+                warnings.append("Could not read %s: %s" % (path, exc))
+    return result, warnings
+
+
+def print_devices(devices):
+    if not devices:
+        print("No AirPods found. Pair/connect them, then run airpods-fw status again.")
+    for device in devices:
+        print("%s [%s] — %s" % (device["name"], device["id"],
+              "connected" if device["connected"] else "disconnected; cached information"))
+        print("  Model:     %s (product %s)" % (device["model"] or "unrecognized", device["product_id"] or "unknown"))
+        print("  Installed: %s" % (device["installed"] or "unknown"))
+        if device["case_version"]:
+            print("  Case:      " + device["case_version"])
+        if device["battery"]:
+            print("  Battery:   " + ", ".join(k + " " + v for k, v in device["battery"].items()))
+        if "public_latest" in device:
+            print("  Public:    %s — %s" % (device["public_latest"] or "unknown", STATUS_TEXT[device["public_status"]]))
+            if device.get("catalog"):
+                for asset in device["catalog"]["assets"]:
+                    print("  Catalog:   %s — %s; eligibility unknown" % (
+                        asset["build"] or "unknown", STATUS_TEXT[compare(device["installed"], asset["build"])]))
+            elif device.get("catalog_error"):
+                print("  Catalog:   " + device["catalog_error"])
+        if version_key(device["installed"]) is None:
+            print("  Firmware value is missing or unrecognized; reconnect and check again.")
+        print()
+
+
+def emit(data, as_json):
+    if as_json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+    for warning in data.get("warnings", []):
+        print("Warning: " + warning, file=sys.stderr)
+
+
+def check_devices(devices):
+    warnings, versions, catalogs = [], {}, {}
+    try:
+        versions = parse_support(fetch(SUPPORT_URL).decode("utf-8-sig"))
+    except (Error, UnicodeError) as exc:
+        warnings.append(str(exc))
+    for device in devices:
+        device["public_latest"] = versions.get(model_key(device["model"] or ""))
+        device["public_status"] = compare(device["installed"], device["public_latest"])
+        model = device["catalog_model"]
+        if model and model not in catalogs:
+            try:
+                catalogs[model] = remote_catalog(model)
+            except Error as exc:
+                catalogs[model] = {"error": str(exc)}
+                warnings.append(str(exc))
+        if model and "error" not in catalogs[model]:
+            device["catalog"] = catalogs[model]
+        else:
+            device["catalog_error"] = catalogs[model]["error"] if model else "no verified catalog association for this model"
+    return warnings
+
+
+def scan_command():
+    require_macos()
+    try:
+        config = plistlib.loads(LAUNCH_PLIST.read_bytes())
+        registrations = config["LaunchEvents"]["com.apple.notifyd.matching"].values()
+        supported = any(entry.get("Notification") == NOTIFICATION for entry in registrations)
+    except (OSError, ValueError, KeyError, AttributeError, plistlib.InvalidFileException, ExpatError) as exc:
+        raise Error("Cannot verify the accessory scan registration on this macOS: %s" % exc) from exc
+    if not supported:
+        raise Error("This macOS does not register the expected accessory scan notification.")
+    return ["/usr/bin/notifyutil", "-p", NOTIFICATION]
+
+
+def watch_versions(baseline, seconds, interval):
+    pending = {d["id"]: d for d in baseline}
+    deadline = time.monotonic() + seconds
+    print("Watching reported firmware for %s seconds; Ctrl-C stops observation." % seconds, flush=True)
+    while pending and time.monotonic() < deadline:
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+        for current in read_devices():
+            before = pending.get(current["id"])
+            # A disappearing/disconnected device or a placeholder is not success.
+            if not before or not current["connected"]:
+                continue
+            old, new = version_key(before["installed"]), version_key(current["installed"])
+            if old is not None and new is not None and new > old:
+                print("%s: firmware increased from %s to %s (reported by macOS)." % (
+                    current["name"], before["installed"], current["installed"]), flush=True)
+                del pending[current["id"]]
+    if pending:
+        print("No firmware increase confirmed for: " + ", ".join(d["name"] for d in pending.values()))
+        print("Open the case and reconnect after the waiting period, then run airpods-fw check.")
+        return 3
+    return 0
+
+
+def update(args, devices):
+    if not devices:
+        raise Error("No AirPods found. Pair/connect them before requesting an update.")
+    command = scan_command()
+    print_devices(devices)
+    print("Prepare: enable Bluetooth and Wi-Fi on the Mac; connect your AirPods first.")
+    print("AirPods/Pro: put both buds in the powered case and close the lid.")
+    print("AirPods Max: connect the headphones to power.")
+    print("Keep them in Bluetooth range for at least 30 minutes.")
+    print("Charging, lid state and update eligibility cannot be verified by this utility.")
+    print("The scan is system-wide; --device only filters display and observation.")
+    if args.dry_run:
+        print("Dry run: would execute " + " ".join(command))
+        if args.watch:
+            print("Would then watch for %s seconds." % args.watch)
+        return 0
+    run(command, timeout=10)
+    print("Scan notification posted. Updater receipt, transfer and installation are not confirmed.", flush=True)
+    if args.watch:
+        return watch_versions(devices, args.watch, args.interval)
+    print("Run airpods-fw logs to observe updater messages, and airpods-fw check after reconnecting.")
+    return 0
+
+
+def logs(args):
+    require_macos()
+    command = ["/usr/bin/log", "show" if args.last else "stream", "--style",
+               "json" if args.json else "compact", "--predicate", PREDICATE, "--info"]
+    if args.debug:
+        command.append("--debug")
+    if args.last:
+        command += ["--last", args.last]
+    elif args.duration:
+        command += ["--timeout", str(args.duration)]
+    print("Apple updater logs (all accessories); messages may contain device identifiers.", file=sys.stderr)
+    print("Log activity alone does not confirm AirPods installation.", file=sys.stderr)
+    if not args.json:
+        return subprocess.call(command)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    try:
+        for line in process.stdout:
+            # macOS puts this non-JSON banner on stdout even with --style json.
+            target = sys.stderr if line.startswith("Filtering the log data using ") else sys.stdout
+            print(line, end="", file=target, flush=True)
+        return process.wait()
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def positive(value):
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version="airpods-fw 1.0.0")
+    sub = parser.add_subparsers(dest="command")
+    for command, description in (
+        ("status", "show known AirPods and installed firmware (default; offline)"),
+        ("check", "compare firmware with live Apple support and catalog listings"),
+        ("update", "request Apple's system-wide accessory scan"),
+        ("assets", "inspect live MobileAsset catalogs or local cached assets"),
+        ("logs", "show raw Apple updater logs"),
+    ):
+        child = sub.add_parser(command, help=description, description=description)
+        if command in ("status", "check", "update"):
+            child.add_argument("--device", help="device ID, name, model or product ID filter")
+        if command != "update":
+            child.add_argument("--json", action="store_true", help="machine-readable output")
+        if command == "update":
+            child.add_argument("--dry-run", action="store_true", help="show the action without posting a notification")
+            child.add_argument("--watch", type=positive, default=0, metavar="SECONDS", help="poll firmware after the scan (e.g. 1800)")
+            child.add_argument("--interval", type=positive, default=30, metavar="SECONDS", help="poll interval (default: 30)")
+        if command == "assets":
+            child.add_argument("--model", type=str.upper, help="asset family, e.g. A3064; defaults to detected verified families")
+            child.add_argument("--local", action="store_true", help="inspect the Mac's cached catalogs and payload metadata")
+        if command == "logs":
+            group = child.add_mutually_exclusive_group()
+            group.add_argument("--last", help="show history instead of streaming, e.g. 30m or 1h")
+            group.add_argument("--duration", type=positive, metavar="SECONDS", help="stop streaming after this duration")
+            child.add_argument("--debug", action="store_true", help="include debug messages")
+    args = parser.parse_args(argv)
+    if args.command is None:
+        args = parser.parse_args(["status"])
+    try:
+        if args.command == "logs":
+            return logs(args)
+        data = {"observed_at": datetime.now(timezone.utc).isoformat(), "warnings": []}
+        if args.command == "assets":
+            if args.local:
+                require_macos()
+                data["catalogs"], data["warnings"] = local_assets(args.model)
+            else:
+                models = [args.model] if args.model else sorted({d["catalog_model"] for d in read_devices() if d["catalog_model"]})
+                data["catalogs"] = []
+                for model in models:
+                    try:
+                        data["catalogs"].append(remote_catalog(model))
+                    except Error as exc:
+                        data["warnings"].append(str(exc))
+            if not args.json:
+                for catalog in data["catalogs"]:
+                    print("%s — %s" % (catalog["model"], catalog.get("kind", "live catalog")))
+                    print("  Source: " + catalog["source"])
+                    if "modified_at" in catalog:
+                        print("  Modified: " + catalog["modified_at"])
+                    for asset in catalog["assets"]:
+                        details = [asset["build"] or "unknown build"]
+                        if asset.get("download_bytes") is not None:
+                            details.append("%.2f MiB" % (asset["download_bytes"] / 1048576))
+                        if "payload_present" in asset:
+                            details.append("payload present" if asset["payload_present"] else "metadata only")
+                        print("  " + " — ".join(details))
+                        if asset.get("url"):
+                            print("  " + asset["url"])
+                if not data["catalogs"]:
+                    print("No catalogs found. Specify an asset family with --model A3064.")
+                print("Catalog presence does not establish release channel, device eligibility or installation.")
+        else:
+            devices = select_devices(read_devices(), args.device)
+            if args.command == "update":
+                return update(args, devices)
+            data["devices"] = devices
+            if args.command == "check" and devices:
+                data["warnings"] = check_devices(devices)
+                data["public_source"] = SUPPORT_URL
+            if not args.json:
+                print_devices(devices)
+                if args.command == "check":
+                    print("Public release listing: " + SUPPORT_URL)
+                    print("Catalog builds may differ; Apple determines channel and installation eligibility.")
+        emit(data, args.json)
+        return 1 if data["warnings"] else 0
+    except BrokenPipeError:
+        raise
+    except (Error, OSError) as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": str(exc)}))
+        print("airpods-fw: " + str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nObservation stopped; any Apple-managed update may continue.", file=sys.stderr)
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
